@@ -4,7 +4,7 @@
 
 This repository contains the **AI and data pipeline** behind the platform. It turns six raw SAP-style Excel extracts into a single SQLite database (`output/spareparts.db`) holding cleaned data, forecasts, optimised stock parameters, recommendations, turnaround readiness and scenario data. The web app reads this database; it never recomputes the models.
 
-**Main platform (web app):** https://github.com/narazla/Caliber
+**Main platform (web app):** https://github.com/narazla/Sparely
 
 ---
 
