@@ -1,6 +1,6 @@
 # Sparely — AI & Data Pipeline
 
-**Spare Part Intelligence & Inventory Optimization** · CALIBER 2026 Final Case
+**Spare Part Intelligence & Inventory Optimization**
 
 This repository contains the **AI and data pipeline** behind Sparely. It turns six raw SAP-style Excel extracts into a single SQLite database (`output/spareparts.db`) holding cleaned data, forecasts, optimised stock parameters, recommendations, turnaround readiness and scenario data.
 
