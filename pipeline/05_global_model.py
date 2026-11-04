@@ -37,7 +37,7 @@ except ImportError:
     ENGINE = "sklearn HistGradientBoosting"
 print("Engine:", ENGINE)
 
-sm = mat[mat.mrp == "Stock Item"]
+sm = mat[mat.in_scope]
 raw = series["raw"].reindex(sm.index).fillna(0)
 HIST = list(raw.columns)
 FUT = list(pd.period_range("2026-10", "2027-03", freq="M"))

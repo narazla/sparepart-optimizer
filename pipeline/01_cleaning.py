@@ -259,6 +259,30 @@ top5 = v.head(5).sum() / v.sum()
 note("BoM", "Inventory value concentrated in few items", 5, "Flagged",
      f"Top 5 items = {top5:.0%} of stock value; verify price/stock before reporting totals")
 
+# ---------------------------------------------------------------- 6b. Non-Stock yang salah klasifikasi
+# Non Stock = dibeli hanya saat dibutuhkan. Jika part kritis (A/B) dipakai berulang dan lead time-nya panjang
+# (atau tidak pernah dibeli lewat PO), status Non Stock memicu pembelian darurat -> kandidat Convert to Stock.
+use_months = mv.assign(m=mv["Posting Date"].dt.to_period("M")).groupby("Material Number")["m"].nunique()
+lt_med = pp[pp.lt_valid].groupby("PR-Material")["lead_time"].median()
+mat["use_months"] = use_months.reindex(mat.index).fillna(0)
+mat["lt_hist"] = lt_med.reindex(mat.index)
+mat["convert_candidate"] = ((mat.mrp == "Non Stock") & mat.criticality.isin(["A", "B"]) & (mat.use_months >= 2)
+                            & ((mat.lt_hist > 42) | mat.lt_hist.isna()))
+mat["in_scope"] = (mat.mrp == "Stock Item") | mat.convert_candidate
+note("BoM", "Non Stock items behaving like stock items (criticality A/B, used in 2+ months, lead time > 42 days or no PO)",
+     int(mat.convert_candidate.sum()), "Flagged",
+     "Recommended for MRP type change to Stock Item; added to optimisation scope")
+ns_stock = int(((mat.mrp == "Non Stock") & (mat.stock > 0)).sum())
+note("BoM", "Non Stock materials holding stock", ns_stock, "Flagged",
+     "Stock exists but is not planned by MRP; included in master-data review list")
+
+# ---------------------------------------------------------------- 6c. Purchasing Group = departemen pemilik barang
+pg = pp.groupby("PR-Material")["PR-Purchasing Group"].agg(lambda x: x.mode().iat[0])
+mat["purchasing_group"] = pg.reindex(mat.index)
+mat["pg_source"] = np.where(mat["purchasing_group"].notna(), "PO history", "inferred from category")
+cat_pg = mat.dropna(subset=["purchasing_group"]).groupby("category")["purchasing_group"].agg(lambda x: x.mode().iat[0])
+mat["purchasing_group"] = mat["purchasing_group"].fillna(mat["category"].map(cat_pg)).fillna(pg.mode().iat[0])
+
 # ---------------------------------------------------------------- 7. simpan
 for name, df in [("bom", bom), ("mv", mv), ("nt", nt), ("fl", fl), ("pp", pp), ("mp", mp), ("mat", mat),
                  ("twins", twin_table)]:

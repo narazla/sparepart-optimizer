@@ -18,7 +18,10 @@ SL_DEFAULT = {"A": 0.99, "B": 0.97, "C": 0.93, "S": 0.90}
 
 mat, cls, dist = load("mat"), load("demand_class"), load("demand_dist")
 series, pp = load("series"), load("pp")
-sm = mat[mat.mrp == "Stock Item"].copy()
+sm = mat[mat.in_scope].copy()
+sm["mrp_type"] = sm["mrp"]
+if has("sourcing"):
+    sm = sm.join(load("sourcing")[["supplier_normal", "price_normal", "supplier_urgent", "lt_urgent", "urgent_source"]])
 
 # ---------------------------------------------------------------- lead time (tahap 4 / sementara)
 if has("lead_time"):
@@ -145,9 +148,10 @@ kp = [("inventory_value", sm.stock_value.sum(), "Total inventory value (incl. es
       ("releasable_share_actual", excess_a / val_a, "Share of actual-priced inventory value that can be released"),
       ("reorder_investment", reorder_inv, "Investment needed for reorders + TAM preparation"),
       ("dead_value", dead, "Dead stock value"),
-      ("stock_items", len(sm), "Stock items (after merging duplicates)"),
+      ("stock_items", int((sm.mrp == "Stock Item").sum()), "Stock items (after merging duplicates)"),
+      ("parts_in_scope", len(sm), "Parts optimised (stock items + Non Stock conversion candidates)"),
       ("critical_stockout_risk", int(((recs.status == "Stockout Risk") & (sm.criticality == "A")).sum()), "Criticality-A parts at stockout risk"),
-      ("critical_zero_stock", int(((sm.stock == 0) & (sm.criticality == "A") & (sm.total_issued > 0)).sum()), "Criticality-A parts used but zero stock"),
+      ("critical_zero_stock", int(((sm.stock == 0) & (sm.criticality == "A") & (sm.total_issued > 0) & (sm.mrp == "Stock Item")).sum()), "Criticality-A parts used but zero stock"),
       ("reorder_count", int((recs.action == "Reorder").sum()), "Parts to reorder"),
       ("dead_count", int((recs.status == "Dead").sum()), "Dead stock items"),
       ("insurance_count", int((recs.status == "Insurance Spare").sum()), "Insurance spares kept"),
@@ -160,7 +164,7 @@ if has("forecast_headline"):
     kp += [("fc_improvement", float(h.improvement_vs_ma6), "Forecast error reduction vs moving average"),
            ("fc_bias_old", float(h.bias_ma6_naive), "Over-forecast bias, old method"),
            ("fc_bias_new", float(h.bias_selected_tam_aware), "Over-forecast bias, proposed policy")]
-for extra in ("kpis_extra", "kpis_tam"):
+for extra in ("kpis_extra", "kpis_tam", "kpis_sourcing"):
     if has(extra):
         kp += [tuple(r) for r in load(extra).itertuples(index=False)]
 if has("gbm_eval"):

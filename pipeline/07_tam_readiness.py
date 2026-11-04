@@ -24,7 +24,7 @@ L = lambda n: pd.read_pickle(os.path.join(INT, f"{n}.pkl"))
 S = lambda df, n: df.to_pickle(os.path.join(INT, f"{n}.pkl"))
 mv, mp, bom, mat, lt, pos, cls, fl = L("mv"), L("mp"), L("bom"), L("mat"), L("lead_time"), L("positions"), L("demand_class"), L("fl")
 TODAY = pd.Timestamp("2026-10-01"); HORIZON = TODAY + pd.DateOffset(months=12)
-sm = mat[mat.mrp == "Stock Item"]
+sm = mat[mat.in_scope]
 
 # ================================================================ A. association rules
 baskets = mv.groupby("Order")["Material Number"].apply(lambda x: sorted(set(x)))
@@ -47,14 +47,28 @@ print(f"Orders {n_orders:,} | multi-part orders {len(baskets):,} | rules {len(ki
 S(kit, "kit_rules")
 
 # ================================================================ B. event maintenance
-WEAR = {"GASKET", "SEAL", "O-RING", "FILTER ELEMENT", "PACKING", "BEARING", "STUDBOLT", "SPRING", "TRIM SET",
-        "SEAT RING", "COUPLING", "IMPELLER", "BELT", "MECHANICAL SEAL", "LAMP", "BRUSH"}
+# Replacement factor (alpha): tidak semua part yang terpasang diganti saat PM.
+#   Consumables/sealing (selalu diganti saat dibuka)  -> alpha = 100%
+#   Part lain -> alpha = pemakaian historis / jumlah terpasang (dibatasi 0..1);
+#                part tanpa histori memakai median alpha kategorinya
+CONSUMABLE = {"GASKET", "O-RING", "FILTER ELEMENT", "PACKING", "PACKING SET", "GREASE", "OIL"}
 ev = mp[(mp.next_due >= TODAY) & (mp.next_due < HORIZON) & (mp.cycle_months >= 1)].copy()
 ev = ev.merge(fl[["Functional Location", "site", "equip_class"]], on="Functional Location", how="left")
 b = bom[bom["Material No"].isin(sm.index)][["Functional Loc.", "Material No", "Installed Qty"]] \
     .groupby(["Functional Loc.", "Material No"], as_index=False)["Installed Qty"].sum()
 b["category"] = b["Material No"].map(sm["category"])
-b = b[b["category"].isin(WEAR)]
+issued = mv.groupby("Material Number")["Quantity"].sum()
+inst_total = b.groupby("Material No")["Installed Qty"].sum()
+alpha_part = (issued.reindex(inst_total.index).fillna(0) / inst_total).clip(0, 1)
+has_hist = issued.reindex(inst_total.index).fillna(0) > 0
+cat_alpha = alpha_part[has_hist].groupby(sm["category"].reindex(alpha_part[has_hist].index)).median()
+alpha = alpha_part.where(has_hist, sm["category"].reindex(alpha_part.index).map(cat_alpha)).fillna(0)
+alpha[sm["category"].reindex(alpha.index).isin(CONSUMABLE)] = 1.0
+b["alpha"] = b["Material No"].map(alpha)
+b["expected"] = b["Installed Qty"] * b["alpha"]
+b = b[b["expected"] >= 0.5]                         # part dengan peluang diganti sangat kecil tidak dihitung
+print(f"Replacement factor: consumables alpha=1; median alpha other parts {alpha[alpha < 1].median():.2f}; "
+      f"BoM lines kept for PM requirements {len(b):,}")
 avail = pos["position"]
 lt80 = lt["lt_p80"]
 
@@ -67,7 +81,8 @@ for row in ev.itertuples(index=False):
         continue
     eid += 1
     due = row.next_due
-    req = {int(m): float(np.ceil(q)) for m, q in zip(parts["Material No"], parts["Installed Qty"])}
+    req = {int(m): float(np.ceil(q)) for m, q in zip(parts["Material No"], parts["expected"])}
+    fac = {int(m): float(a) for m, a in zip(parts["Material No"], parts["alpha"])}
     src = {m: "bom" for m in req}
     if kit_by_a is not None:
         for m in list(req):
@@ -82,7 +97,7 @@ for row in ev.itertuples(index=False):
         sf = max(q - a, 0)
         short += sf > 0
         eparts.append(dict(event_id=eid, material_no=m, required_qty=q, available_qty=a, shortfall=sf,
-                           order_by_date=ob.strftime("%Y-%m-%d"), source=src[m]))
+                           order_by_date=ob.strftime("%Y-%m-%d"), source=src[m], replace_factor=fac.get(m)))
     events.append(dict(event_id=eid, funcloc=row[0], funcloc_desc=row[1], site=row.site, system=row.equip_class,
                        criticality=row[2], task=row[5], cycle_months=row.cycle_months,
                        due_date=due.strftime("%Y-%m-%d"), n_parts=len(req), n_short=short,

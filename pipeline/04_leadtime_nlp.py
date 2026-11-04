@@ -77,7 +77,7 @@ print("\nLead time backtest (pinball loss, lower=better; coverage target = quant
 
 # fit final pada seluruh data, prediksi "order berikutnya" untuk setiap stock item
 final = {a: qmodel(a).fit(d[FEATS], d["y"]) for a in (0.5, 0.8)}
-sm = mat[mat.mrp == "Stock Item"]
+sm = mat[mat.in_scope]
 hist = d.groupby("PR-Material").agg(supplier=("supplier", lambda x: x.mode().iat[0]),
                                     pgroup=("pgroup", lambda x: x.mode().iat[0]),
                                     prtype=("prtype", lambda x: x.mode().iat[0]),
@@ -110,6 +110,54 @@ sup = d.groupby("PO-Supplier Code").agg(name=("PO-Supplier Name", "first"), n_po
                                         late_rate=("is_late", "mean"))
 sup["reliability"] = (100 * (0.6 * (1 - sup.late_rate) + 0.4 * (1 - sup.lt_cv.clip(0, 1)))).round(1)
 sup.index.name = "supplier_code"
+
+# ---------------------------------------------------------------- A2. dual-mode sourcing
+# Normal  : supplier termurah untuk part tsb (harga median per unit)
+# Urgent  : supplier tercepat & paling tepat waktu (lead time efektif = median LT x (1 + late rate));
+#           jika part hanya punya 1 supplier, ambil supplier paling andal di kategori yang sama (min. 5 PO)
+ps = d.groupby(["PR-Material", "PO-Supplier Code"]).agg(name=("PO-Supplier Name", "first"),
+                                                        price=("unit_price_idr", "median"),
+                                                        lt=("lead_time", "median"), late=("is_late", "mean"),
+                                                        n=("y", "size")).reset_index()
+ps["eff_lt"] = ps["lt"] * (1 + ps["late"])
+normal = ps.loc[ps.groupby("PR-Material")["price"].idxmin()].set_index("PR-Material")
+urgent = ps.loc[ps.groupby("PR-Material")["eff_lt"].idxmin()].set_index("PR-Material")
+n_sup = ps.groupby("PR-Material").size()
+cat_sup = d.groupby(["category", "PO-Supplier Code"], observed=True).agg(
+    name=("PO-Supplier Name", "first"), lt=("lead_time", "median"), late=("is_late", "mean"), n=("y", "size")).reset_index()
+cat_sup = cat_sup[cat_sup.n >= 5]
+cat_sup["eff_lt"] = cat_sup["lt"] * (1 + cat_sup["late"])
+cat_best = cat_sup.loc[cat_sup.groupby("category", observed=True)["eff_lt"].idxmin()].set_index("category")
+src = pd.DataFrame(index=sm.index)
+src["supplier_normal"] = normal["name"].reindex(src.index)
+src["price_normal"] = normal["price"].reindex(src.index)
+src["lt_normal"] = normal["lt"].reindex(src.index)
+src["supplier_urgent"] = urgent["name"].reindex(src.index)
+src["lt_urgent"] = urgent["lt"].reindex(src.index)
+src["late_urgent"] = urgent["late"].reindex(src.index)
+src["urgent_source"] = np.where(n_sup.reindex(src.index).fillna(0) > 1, "same part, faster supplier", "same part")
+single = n_sup.reindex(src.index).fillna(0) <= 1
+cb = sm["category"].map(cat_best["name"]); cl = sm["category"].map(cat_best["lt"]); cr = sm["category"].map(cat_best["late"])
+no_hist = src["supplier_urgent"].isna() & cb.notna()
+faster = single & cb.notna() & src["supplier_urgent"].notna() & \
+         (cl * (1 + cr) < 0.8 * src["lt_urgent"] * (1 + src["late_urgent"].fillna(0)))
+for mask, label in ((faster, "alternative supplier, same category (>=20% faster)"),
+                    (no_hist, "suggested supplier, same category (no purchase history)")):
+    src.loc[mask, "supplier_urgent"] = cb[mask]; src.loc[mask, "lt_urgent"] = cl[mask]
+    src.loc[mask, "late_urgent"] = cr[mask]; src.loc[mask, "urgent_source"] = label
+src.loc[no_hist, "supplier_normal"] = cb[no_hist]
+src.loc[no_hist, "lt_normal"] = cl[no_hist]
+src["urgent_source"] = np.where(src["supplier_urgent"].isna(), None, src["urgent_source"])
+multi = int((n_sup > 1).sum()); diff = int(((n_sup > 1) & (normal["name"] != urgent["name"].reindex(normal.index))).sum())
+print(f"\nSourcing: {multi} parts with >1 supplier ({diff} where cheapest != fastest); "
+      f"{int(faster.sum())} single-supplier parts get a >=20% faster alternative; "
+      f"{int(no_hist.sum())} parts without purchase history get a suggested supplier")
+S(src, "sourcing")
+S(pd.DataFrame([("multi_supplier_parts", multi, "Parts bought from more than one supplier"),
+                ("cheap_vs_fast_differs", diff, "Parts where cheapest supplier is not the fastest"),
+                ("category_alternatives", int(faster.sum()), "Single-supplier parts with a >=20% faster alternative in the same category"),
+                ("suggested_supplier_new", int(no_hist.sum()), "Parts without purchase history given a suggested supplier")],
+               columns=["key", "value", "label"]), "kpis_sourcing")
 S(lt, "lead_time"); S(sup.reset_index(), "suppliers"); S(lt_eval, "lt_eval")
 
 # ================================================================ B. NLP NOTIFIKASI

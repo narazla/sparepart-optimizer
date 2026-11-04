@@ -22,7 +22,7 @@ mv = pd.read_pickle(os.path.join(INT, "mv.pkl"))
 
 MONTHS = pd.period_range("2025-05", "2026-09", freq="M")
 N_TRAIN, H = 11, 6
-stock_items = mat.index[mat.mrp == "Stock Item"]
+stock_items = mat.index[mat.in_scope]
 
 # ---------------------------------------------------------------- deret bulanan
 mv["month"] = mv["Posting Date"].dt.to_period("M")

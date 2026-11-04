@@ -10,6 +10,7 @@ if os.path.exists(OUT):
     os.remove(OUT)
 con = sqlite3.connect(OUT)
 con.executescript(open(os.path.join(HERE, "schema.sql")).read())
+cols = lambda t, n: ",".join(r[1] for r in con.execute(f"PRAGMA table_info({t})").fetchall()[:n])
 
 N = 300
 cats = ["BEARING", "VALVE", "GASKET", "SEAL", "COUPLING", "TRANSMITTER", "STUDBOLT", "O-RING"]
@@ -31,7 +32,7 @@ for i in range(N):
     mn, mx = random.choice([(0, 0), (1, 2), (2, 5), (5, 12)])
     pat = random.choice(patterns)
     mats.append(mno)
-    con.execute("INSERT INTO parts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+    con.execute("INSERT INTO parts (" + cols("parts", 28) + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
         mno, f"{cat},DUMMY PART {i}", cat, "EA", random.choice("AAABBCS"), random.choice(["PX", "PY", "PX+PY"]),
         random.choice(systems), random.randint(1, 6), random.randint(1, 8), stock, mn, mx, price,
         random.choice(["actual", "estimated"]), stock * price, None, pat, round(random.uniform(1, 17), 2),
@@ -53,7 +54,7 @@ for i in range(N):
     rop = random.randint(0, 8)
     con.execute("INSERT INTO parameters VALUES (?,?,?,?,?,?,?)", (mno, sl, max(0, rop - 2), rop, rop + 4, 4, rop))
     st = random.choice(list(statuses))
-    con.execute("INSERT INTO recommendations VALUES (?,?,?,?,?,?,?,?,?,?)", (
+    con.execute("INSERT INTO recommendations (" + cols("recommendations", 10) + ") VALUES (?,?,?,?,?,?,?,?,?,?)", (
         mno, st, statuses[st], random.randint(0, 10), str(today + timedelta(days=random.randint(0, 90))),
         random.choice([-1, 1]) * price * random.randint(1, 5), round(random.random(), 2), round(random.random() * 100, 1),
         int(random.random() < .2), "Dummy reason: stock below new reorder point; lead time P80 95 days."))
@@ -69,7 +70,7 @@ for e in range(1, 61):
         n, short, round(1 - short / n, 2)))
     for mno in random.sample(mats, n):
         req = random.randint(1, 4); av = random.randint(0, 4)
-        con.execute("INSERT INTO event_parts VALUES (?,?,?,?,?,?,?)", (e, mno, req, av, max(0, req - av),
+        con.execute("INSERT INTO event_parts (" + cols("event_parts", 7) + ") VALUES (?,?,?,?,?,?,?)", (e, mno, req, av, max(0, req - av),
                                                                      str(today + timedelta(days=random.randint(0, 200))),
                                                                      random.choice(["bom", "kit"])))
 for m in hist:

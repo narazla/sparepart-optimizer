@@ -31,7 +31,15 @@ CREATE TABLE parts (
   late_rate          REAL,              -- 0..1
   main_supplier      TEXT,
   notif_12m          INTEGER,           -- notifikasi kerusakan di FuncLoc terkait, 12 bulan terakhir
-  has_anomaly        INTEGER            -- 0/1
+  has_anomaly        INTEGER,           -- 0/1
+  mrp_type           TEXT,              -- 'Stock Item' | 'Non Stock' (Non Stock = kandidat Convert to Stock)
+  purchasing_group   TEXT,              -- departemen pemilik barang (MR1, MOD, ...)
+  pg_source          TEXT,              -- 'PO history' | 'inferred from category'
+  supplier_normal    TEXT,              -- supplier termurah
+  price_normal       REAL,
+  supplier_urgent    TEXT,              -- supplier tercepat / paling tepat waktu
+  lt_urgent          REAL,
+  urgent_source      TEXT
 );
 
 -- Konsumsi bulanan (histori)
@@ -80,14 +88,16 @@ CREATE TABLE parameters (
 CREATE TABLE recommendations (
   material_no     INTEGER PRIMARY KEY,
   status          TEXT,                 -- Stockout Risk | Overstock | Slow-moving | Dead | Insurance Spare | Healthy
-  action          TEXT,                 -- Reorder | Reduce | Review/Dispose | Keep | Monitor | Maintain | Use twin stock
+  action          TEXT,                 -- Reorder | Convert to Stock | Plan for TAM | Reduce | Review/Dispose | Keep | Monitor | Maintain
   qty             REAL,                 -- qty pesan (Reorder) atau qty dilepas (Reduce)
   order_by_date   TEXT,
   value_impact    REAL,                 -- + modal dilepas, - investasi tambahan
   stockout_risk   REAL,                 -- 0..1
   priority        REAL,                 -- untuk urutan default
   tam_linked      INTEGER,
-  reason          TEXT                  -- kalimat "Why this recommendation"
+  reason          TEXT,                 -- kalimat "Why this recommendation"
+  sourcing_mode   TEXT,                 -- 'Normal' | 'Urgent' (hanya untuk aksi pembelian)
+  supplier        TEXT                  -- supplier yang direkomendasikan sesuai mode
 );
 
 -- Event maintenance 12 bulan ke depan
@@ -113,7 +123,8 @@ CREATE TABLE event_parts (
   available_qty  REAL,
   shortfall      REAL,
   order_by_date  TEXT,
-  source         TEXT,                  -- 'bom' | 'kit'
+  source         TEXT,                  -- 'bom' | 'kit' | 'tam'
+  replace_factor REAL,                  -- porsi jumlah terpasang yang diganti saat PM (alpha)
   PRIMARY KEY (event_id, material_no)
 );
 

@@ -36,7 +36,7 @@ N_SIM = 3000
 
 mat, dist, need, lt, cls = L("mat"), L("demand_dist"), L("need_prob"), L("lead_time"), L("demand_class")
 series, pp, tw = L("series"), L("pp"), L("twins")
-sm = mat[mat.mrp == "Stock Item"].copy()
+sm = mat[mat.in_scope].copy()
 sm = sm.join(lt[["lt_p50", "lt_p80", "late_rate", "main_supplier"]]).join(cls[["pattern", "tam_qty", "total_issued"]])
 sm = sm.join(dist[["size_mean", "size_sd", "p_month"]])
 sm["p_gbm"] = need.groupby("material_no")["need_prob_gbm"].mean()
@@ -124,6 +124,8 @@ twin_n = tw.groupby("twin_group").size()
 r["twin_group"] = tw[tw.is_primary == 1].set_index("material_no")["twin_group"].reindex(r.index)
 
 def decide(x):
+    if x.mrp == "Non Stock":                       # kandidat dari tahap 1: dipakai berulang, kritis, lead time panjang
+        return "Misclassified Non-Stock", "Convert to Stock"
     if x.mu_month > 0:
         if x.position <= x.rop or (x.days_to_rop is not np.nan and x.days_to_rop <= 30):
             return "Stockout Risk", "Reorder"
@@ -144,21 +146,33 @@ def decide(x):
 
 dec = r.apply(decide, axis=1, result_type="expand"); dec.columns = ["status", "action"]
 r = r.join(dec)
+BUY = ["Reorder", "Plan for TAM", "Convert to Stock"]
 qty = np.select(
-    [r.action == "Reorder", r.action == "Plan for TAM", r.action == "Reduce", r.action == "Review/Dispose"],
-    [(r.max_new - r.position).clip(lower=1), (r.tam_qty - r.position).clip(lower=0),
+    [r.action == "Reorder", r.action == "Convert to Stock", r.action == "Plan for TAM", r.action == "Reduce",
+     r.action == "Review/Dispose"],
+    [(r.max_new - r.position).clip(lower=1), np.where(r.position <= r.rop, (r.max_new - r.position).clip(lower=1), 0), (r.tam_qty - r.position).clip(lower=0),
      (r.stock - r.max_new).clip(lower=0), r.stock], 0)
 r["qty"] = np.ceil(qty)
-r["value_impact"] = np.where(r.action.isin(["Reorder", "Plan for TAM"]), -r.qty * r.price, r.qty * r.price)
-r.loc[~r.action.isin(["Reorder", "Plan for TAM", "Reduce", "Review/Dispose"]), "value_impact"] = 0.0
+r["value_impact"] = np.where(r.action.isin(BUY), -r.qty * r.price, r.qty * r.price)
+r.loc[~r.action.isin(BUY + ["Reduce", "Review/Dispose"]), "value_impact"] = 0.0
 od = TODAY + pd.to_timedelta(r["days_to_rop"].clip(lower=0, upper=30).fillna(0), unit="D")
-r["order_by_date"] = np.where(r.action == "Reorder", od.dt.strftime("%Y-%m-%d"), None)
+r["order_by_date"] = np.where(r.action == "Reorder", od.dt.strftime("%Y-%m-%d"),
+                              np.where(r.action == "Convert to Stock", TODAY.strftime("%Y-%m-%d"), None))
 CW = {"A": 4, "B": 3, "C": 2, "S": 1}
 r["priority"] = np.where(r.action == "Reorder", 50 + 12 * r.criticality.map(CW) * (0.3 + r.risk),
+                         np.where(r.action == "Convert to Stock", 45 + 5 * r.criticality.map(CW),
                          np.where(r.action == "Plan for TAM", 40 + 5 * r.criticality.map(CW),
-                                  np.minimum(39, np.log10(r.value_impact.abs() + 1) * 3)))
+                                  np.minimum(39, np.log10(r.value_impact.abs() + 1) * 3))))
 r["tam_linked"] = (r.tam_qty > 0).astype(int)
 r["stockout_risk"] = r["risk"]
+
+# dual-mode sourcing: urgent untuk part kelas A yang mendesak, normal (termurah) untuk sisanya
+src = L("sourcing")
+r = r.join(src)
+urgent = r.action.isin(BUY) & (r.criticality == "A") & ((r.risk >= 0.2) | (r.position <= r.safety_stock))
+r["sourcing_mode"] = np.where(r.action.isin(BUY), np.where(urgent, "Urgent", "Normal"), None)
+r["supplier"] = np.where(r.sourcing_mode == "Urgent", r.supplier_urgent,
+                         np.where(r.sourcing_mode == "Normal", r.supplier_normal.fillna(r.supplier_urgent), None))
 
 def rp(v):
     return f"Rp {v/1e9:,.1f} bn" if abs(v) >= 1e9 else f"Rp {v/1e6:,.0f} M"
@@ -171,6 +185,16 @@ def reason(x):
                  f"there is a {x.risk:.0%} chance of running out before a new order arrives.")
         s.append(f"Order {x.qty:g} unit(s) to restore the new maximum of {x.max_new:g} (criticality {x.criticality}, "
                  f"service level {x.service_level:.1%}).")
+    elif x.action == "Convert to Stock":
+        s.append(f"Set up as Non Stock (bought only when needed), but used in {x.use_months:.0f} of the last 17 months "
+                 f"on criticality-{x.criticality} equipment"
+                 + (f", with a historical lead time of {x.lt_hist:.0f} days." if x.lt_hist == x.lt_hist
+                    else ", and never bought through a regular PO."))
+        s.append(f"Every failure therefore triggers emergency buying. Change the SAP MRP type to Stock Item with "
+                 f"Min {x.min_new:g} / Max {x.max_new:g}"
+                 + (f" and buy {x.qty:g} unit(s) as initial stock." if x.qty > 0
+                    else f"; current position of {x.position:g} unit(s) (on hand {x.stock:g} + on order {x.on_order:g}) is above the new "
+                         f"minimum, so no extra purchase is needed now."))
     elif x.action == "Plan for TAM":
         s.append(f"No routine demand, but {x.tam_qty:g} unit(s) were consumed during the last turnaround window.")
         s.append(f"Current position is {x.position:g}; order {x.qty:g} unit(s) before the next TAM "
@@ -194,12 +218,19 @@ def reason(x):
         s.append("Stock is healthy, but recent consumption contains abnormal spikes. Review usage before the next order.")
     else:
         s.append(f"Stock {x.stock:g} is within the new range {x.min_new:g} to {x.max_new:g}.")
+    if x.sourcing_mode == "Urgent" and isinstance(x.supplier, str):
+        s.append(f"Urgent sourcing: use {x.supplier} (lead time about {x.lt_urgent:.0f} days, "
+                 f"{x.late_urgent:.0%} late; {x.urgent_source}).")
+    elif x.sourcing_mode == "Normal" and isinstance(x.supplier, str):
+        s.append(f"Normal sourcing: {x.supplier}" + (f" at about {rp(x.price_normal)} per unit."
+                                                     if x.price_normal == x.price_normal else "."))
     if x.name in false_so_primary:
         s.append(f"Note: this part existed under {int(twin_n.get(x.twin_group, 2))} material numbers; "
                  f"stock has been consolidated (some numbers showed zero stock while a twin had stock).")
     return " ".join(s)
 r["reason"] = r.apply(reason, axis=1)
-recs = r[["status", "action", "qty", "order_by_date", "value_impact", "stockout_risk", "priority", "tam_linked", "reason"]]
+recs = r[["status", "action", "qty", "order_by_date", "value_impact", "stockout_risk", "priority", "tam_linked",
+          "sourcing_mode", "supplier", "reason"]]
 print(recs.groupby(["status", "action"]).agg(n=("qty", "size"), value_bn=("value_impact", lambda v: v.sum() / 1e9)).round(1))
 
 # ---------------------------------------------------------------- 5. replay backtest
@@ -227,8 +258,10 @@ def replay(s_lvl, S_lvl, label, tam_plan=None):
         for i in np.flatnonzero(q > 0):
             pipe.setdefault(t + Lm[i], np.zeros(n))[i] += q[i]
         out.append(dict(month=str(mo), policy=label, inventory_value=float((on_hand * price).sum()),
-                        stockouts=int(short.sum()), stockouts_critical=int((short & crit_a).sum())))
+                        stockouts=int(short.sum()), stockouts_critical=int((short & crit_a).sum()),
+                        stockouts_si=int((short & is_si).sum()), stockouts_si_a=int((short & is_si & crit_a).sum())))
     return pd.DataFrame(out)
+is_si = (sm["mrp"] == "Stock Item").values
 
 old = replay(sm["min_old"].values, sm["max_old"].values, "current")
 new_s, new_S = params["rop"].fillna(0).values, params["max_new"].fillna(0).values
@@ -241,7 +274,9 @@ newt = replay(new_s, new_S, "proposed", tam_plan=tam_plan)
 bt = pd.concat([old, newt])
 summ = pd.concat([old, new, newt]).groupby("policy").agg(avg_inv_bn=("inventory_value", lambda v: v.mean() / 1e9),
                                                          stockouts=("stockouts", "sum"),
-                                                         critical=("stockouts_critical", "sum"))
+                                                         critical=("stockouts_critical", "sum"),
+                                                         stock_items=("stockouts_si", "sum"),
+                                                         stock_items_a=("stockouts_si_a", "sum"))
 print("\nReplay 17 bulan:\n", summ.round(1).to_string())
 demand_events = int((dem > 0).sum())
 
@@ -256,6 +291,14 @@ extra = [
     ("bt_inv_old", o.avg_inv_bn * 1e9, "Replay: average inventory value, current"),
     ("bt_inv_new", n_.avg_inv_bn * 1e9, "Replay: average inventory value, proposed policy"),
     ("bt_demand_events", demand_events, "Replay: part-months with demand"),
+    ("bt_si_old", o.stock_items, "Replay: stockouts, current stock items only"),
+    ("bt_si_new", n_.stock_items, "Replay: stockouts, stock items only, proposed policy"),
+    ("bt_si_policy_only", summ.loc["proposed_policy", "stock_items"], "Replay: stockouts, stock items only, parameters without TAM readiness"),
+    ("bt_policy_only", summ.loc["proposed_policy", "stockouts"], "Replay: stockouts, parameters without TAM readiness"),
+    ("bt_si_a_old", o.stock_items_a, "Replay: criticality-A stockouts, stock items only, current"),
+    ("bt_si_a_new", n_.stock_items_a, "Replay: criticality-A stockouts, stock items only, proposed"),
+    ("convert_to_stock", int((r.action == "Convert to Stock").sum()), "Non Stock parts recommended to convert to Stock Item"),
+    ("urgent_sourcing", int((r.sourcing_mode == "Urgent").sum()), "Buy recommendations using urgent sourcing"),
     ("on_order_lines", int((sm.on_order > 0).sum()), "Parts with open purchase orders"),
     ("carry_rate", CARRY, "Assumed carrying cost per year"),
     ("stockout_cost_A", STOCKOUT_COST["A"], "Assumed cost per stockout, criticality A"),
