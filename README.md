@@ -21,13 +21,15 @@ Spare parts at a naphtha-cracker complex are planned reactively with static Min�
 | --- | --- |
 | Data quality | 47% of PR/PO rows were exact duplicates; 597 material numbers were really 133 parts (duplicate material master) |
 | False stockouts | 66 parts showed zero stock under one number while a twin number held stock |
-| Turnaround effect | 37% of all consumption happened in the 3-month window around the Jan-2026 turnaround (TAM); 220 parts are used only during TAM |
-| Forecast | 11% lower total-demand error than a 6-month moving average; over-forecast bias cut from +61% to +43% |
+| Turnaround effect | 37% of all consumption happened in the 3-month window around the Jan-2026 turnaround (TAM); 220+ parts are used only during TAM |
+| Non-Stock misclassification | 119 Non Stock parts (criticality A/B, used repeatedly, long lead time) recommended to become Stock Items; 1,636 Non Stock materials hold unplanned stock |
+| Forecast | 12% lower total-demand error than a 6-month moving average; over-forecast bias cut from +63% to +44% |
 | Lead time | P80 lead-time error 62% lower than historical per-part quantiles |
-| Need probability | ROC-AUC 0.93 (baseline 0.91); top 10% of risk scores capture 80% of actual demand |
+| Need probability | ROC-AUC 0.92 (baseline 0.91); top 10% of risk scores capture 76% of actual demand |
 | Notification NLP | 94% cross-validated accuracy (Failure / Repair-Replace / Routine-Support) |
-| Replay vs current Min–Max | Stockout events 938 → 150 (−84%); criticality-A stockouts 795 → 88 (−89%), incl. turnaround readiness. Parameters alone: −59% stockouts |
-| Turnaround readiness | Repeat of Jan-2026 TAM scope: 655 parts, 226 short today (65% ready) |
+| Replay vs current Min–Max (stock items) | Stockouts 938 → 385 with new parameters (−59%), → 147 with turnaround readiness (−84%); criticality-A stockouts 795 → 87 (−89%) |
+| Turnaround readiness | Repeat of Jan-2026 TAM scope: 750 parts, 276 short today (63% ready) |
+| Sourcing | 368 urgent buys routed to the fastest, most on-time supplier; 211 normal buys to the cheapest |
 
 > All results come from the dummy baseline dataset provided by the organisers. See [Limitations](#limitations).
 
@@ -49,12 +51,12 @@ data/raw/*.xlsx  (BoM, Movement Material, Notif History, FuncLoc List, PR PO, Mi
 
 | Stage | Script | What it does | Method |
 | --- | --- | --- | --- |
-| 1 | `01_cleaning.py` | Removes exact duplicates, standardises 28 maintenance-cycle spellings, validates dates, merges duplicate material masters, builds the material master (criticality, site, equipment class), estimates missing prices, flags abnormal consumption, writes a data-quality log | Entity resolution (TF-IDF + attribute check), kNN price model, Isolation Forest |
+| 1 | `01_cleaning.py` | Removes exact duplicates, standardises 28 maintenance-cycle spellings, validates dates, merges duplicate material masters, builds the material master (criticality, site, equipment class, purchasing group), estimates missing prices, flags abnormal consumption and misclassified Non Stock parts, writes a data-quality log | Entity resolution (TF-IDF + attribute check), kNN price model, Isolation Forest |
 | 2 | `02_forecast.py` | Classifies demand patterns, separates turnaround demand from routine demand, backtests five models, selects the best model per pattern | ADI / CV² (Syntetos–Boylan), MA6, SES, Croston, SBA, TSB |
-| 3 | `04_leadtime_nlp.py` | Predicts P50/P80 lead time per part and supplier reliability; classifies notification text | Quantile gradient boosting; TF-IDF + logistic regression (weak supervision) |
+| 3 | `04_leadtime_nlp.py` | Predicts P50/P80 lead time per part, scores supplier reliability, selects normal and urgent suppliers; classifies notification text | Quantile gradient boosting; TF-IDF + logistic regression (weak supervision) |
 | 4 | `05_global_model.py` | One model across all parts predicting the probability that a part is needed next month | Gradient boosting classifier on a part × month panel |
-| 5 | `06_optimize.py` | Simulates lead-time demand, picks the cost-optimal service level per part, sets new Min / Max / safety stock / reorder point, generates actions and plain-language reasons, builds the scenario grid, replays 17 months vs current Min–Max | Monte Carlo simulation, cost–risk optimisation |
-| 6 | `07_tam_readiness.py` | Learns which parts are used together, schedules maintenance events for the next 12 months, scores readiness, builds a turnaround scenario | Association rules (support / confidence / lift) |
+| 5 | `06_optimize.py` | Simulates lead-time demand, picks the cost-optimal service level per part, sets new Min / Max / safety stock / reorder point, generates actions (incl. Convert to Stock) with sourcing mode and plain-language reasons, builds the scenario grid, replays 17 months vs current Min–Max | Monte Carlo simulation, cost–risk optimisation |
+| 6 | `07_tam_readiness.py` | Learns which parts are used together, applies a replacement factor to BoM quantities, schedules maintenance events for the next 12 months, scores readiness, builds a turnaround scenario | Association rules (support / confidence / lift) |
 | 7 | `09_export.py` | Writes all tables and KPIs to SQLite following `schema.sql` | — |
 
 ---
@@ -67,44 +69,57 @@ data/raw/*.xlsx  (BoM, Movement Material, Notif History, FuncLoc List, PR PO, Mi
 - **Missing prices:** 2,575 stock items have no purchase history. Prices are estimated by k-nearest neighbours on description text (5-fold CV: 56% of estimates within 2× of the true price vs 50% for category median). Estimated prices are labelled `estimated`.
 - **Abnormal consumption:** Isolation Forest + ≥ 5× part median flags 446 transactions; spikes are capped for training and shown as *Monitor* alerts.
 
-### 2. Demand forecasting (turnaround-aware)
+### 2. Non-Stock to Stock conversion
+- A Non Stock material is flagged when it is criticality A or B, used in at least 2 of 17 months, and has a historical lead time above 42 days (median of all POs) or no regular PO at all.
+- 119 parts qualify. They are optimised like stock items and receive a recommendation to change the SAP MRP type to Stock Item with new Min/Max; 80 also need initial stock.
+
+### 3. Demand forecasting (turnaround-aware)
 - Consumption is aggregated monthly per part and classified as Smooth, Erratic, Intermittent, Lumpy, Sporadic, TAM-only or No demand.
 - Nov-2025 to Jan-2026 is treated as the **turnaround window** (37% of consumption, 2–3× normal maintenance orders). Routine forecasts are trained without it; turnaround needs are planned through readiness instead.
-- **Backtest:** train May-25 → Mar-26, test Apr-26 → Sep-26. Metrics: scaled MAE, bias and total-demand error (MAPE is avoided because of zeros).
+- **Backtest:** train May-25 → Mar-26, test Apr-26 → Sep-26 on 751 parts. Metrics: scaled MAE, bias and total-demand error (MAPE is avoided because of zeros). SES wins for all routine patterns; TSB is used for TAM-only and No demand.
 
-### 3. Lead time (quantile regression)
+### 4. Lead time (quantile regression)
 - Gradient boosting with quantile loss predicts P50 and P80 lead time from supplier, purchasing group, PR type, material category, criticality, quantity, price, requested lead time and month.
 - **Backtest:** train on PRs before Apr-26, test after. P80 coverage 75% (target 80%).
 - Supplier reliability score = 60% on-time rate + 40% lead-time stability.
 
-### 4. Notification NLP
+### 5. Dual-mode sourcing
+- **Normal:** cheapest supplier for the part (median unit price).
+- **Urgent:** supplier with the shortest effective lead time = median lead time × (1 + late rate). For single-supplier parts, a supplier from the same category (≥ 5 POs) is suggested when it is at least 20% faster.
+- Urgent mode is applied to criticality-A buys with ≥ 20% chance of running out or stock below safety stock.
+
+### 6. Notification NLP
 - Keyword rules label 93% of notifications; a TF-IDF + logistic regression model labels the rest. N2 notifications (all *Emergency*) are always *Failure*.
 - Failure + Repair notifications on the functional locations where a part is installed become a feature for the global model.
 
-### 5. Global need-probability model
-- A single gradient boosting classifier trained on all parts (26k part-months) so that parts with short histories borrow strength from similar parts.
+### 7. Global need-probability model
+- A single gradient boosting classifier trained on all parts (27k part-months) so that parts with short histories borrow strength from similar parts.
 - Most important features: historical frequency, **number of functional locations where the part is installed**, equipment class, category, recent failure notifications.
 
-### 6. Cost–risk optimisation
+### 8. Cost–risk optimisation
 - Lead-time demand is simulated 3,000 times per part: lead time ~ lognormal (calibrated to P50/P80), demand events ~ Poisson, sizes ~ Gamma.
 - For each service level (80% → 99.5%): reorder point = quantile of lead-time demand, Max = ROP + EOQ, expected inventory value and expected stockouts per year.
 - The chosen service level minimises **carrying cost + expected stockouts × stockout cost by criticality**.
 - Open purchase orders (delivery after 30 Sep 2026) count as stock on order.
 
-### 7. Turnaround & maintenance readiness
-- Maintenance items with cycles ≥ 1 month and a due date in the next 12 months are linked to wear parts installed on the same functional location, plus parts that association rules say are usually issued together.
+### 9. Turnaround & maintenance readiness
+- Maintenance items with cycles ≥ 1 month and a due date in the next 12 months are linked to parts installed on the same functional location, plus parts that association rules say are usually issued together.
+- **Replacement factor (alpha):** consumables and sealing parts (gasket, O-ring, filter element, packing, grease, oil) = 100%; other parts = historical issued quantity ÷ installed quantity (capped at 1, category median when no history; median 0.33). Requirement = installed quantity × alpha; lines below 0.5 units are ignored.
 - Readiness = share of required parts covered by stock on hand + on order; order-by date = due date − P80 lead time.
 
 ### Recommendation logic
 
 | Status | Action | Rule |
 | --- | --- | --- |
+| Misclassified Non-Stock | Convert to Stock | Non Stock, criticality A/B, used in 2+ months, lead time > 42 days or no PO |
 | Stockout Risk | Reorder | Stock + on order ≤ new reorder point, or reaches it within 30 days |
 | Overstock / Slow-moving | Reduce | Stock above new Max (slow-moving if cover > 24 months) |
 | TAM Reserve | Plan for TAM / Keep | No routine demand but used during the last turnaround |
 | Insurance Spare | Keep / Reduce | No demand, criticality A; keep a small cover, release the rest |
 | Dead | Review / Dispose | No demand, no turnaround use, not criticality A |
 | Healthy | Maintain / Monitor | Within range; *Monitor* if abnormal spikes were detected |
+
+Every buy recommendation carries a sourcing mode (Normal / Urgent) and a recommended supplier. Every part carries a purchasing group (department owner) from PO history, or inferred from its category.
 
 ---
 
@@ -167,22 +182,22 @@ python pipeline/make_dummy_db.py      # -> output/spareparts_dummy.db
 
 | Table | Rows | Content |
 | --- | --- | --- |
-| `parts` | 3,305 | One row per stock item after merging duplicates: criticality, site, equipment class, stock, old Min/Max, price, pattern, lead time, failure signal |
-| `demand_monthly` | 4,493 | Monthly consumption with anomaly flag |
-| `forecasts` | 19,830 | 6-month forecast, 80% interval, need probability, PM due flag |
-| `model_eval` | 3,320 | Backtest error per part and model; `selected = 1` for the model in use |
-| `parameters` | 3,305 | New service level, safety stock, ROP (= Min), Max, order quantity |
-| `recommendations` | 3,305 | Status, action, quantity, order-by date, value impact, stockout risk, priority, reason |
-| `maintenance_events` | 1,493 | Maintenance events in the next 12 months + turnaround scenario, readiness |
-| `event_parts` | 6,258 | Parts required per event, shortfall, order-by date, source (`bom` / `kit` / `tam`) |
+| `parts` | 3,424 | One row per part in scope (3,305 stock items + 119 Non Stock conversion candidates): criticality, site, equipment class, MRP type, purchasing group, stock, old Min/Max, price, pattern, lead time, normal and urgent supplier |
+| `demand_monthly` | 4,905 | Monthly consumption with anomaly flag |
+| `forecasts` | 20,544 | 6-month forecast, 80% interval, need probability, PM due flag |
+| `model_eval` | 3,755 | Backtest error per part and model; `selected = 1` for the model in use |
+| `parameters` | 3,424 | New service level, safety stock, ROP (= Min), Max, order quantity |
+| `recommendations` | 3,424 | Status, action, quantity, order-by date, value impact, stockout risk, priority, sourcing mode, supplier, reason |
+| `maintenance_events` | 2,294 | Maintenance events in the next 12 months + turnaround scenario, readiness |
+| `event_parts` | 9,488 | Parts required per event, replacement factor, shortfall, order-by date, source (`bom` / `kit` / `tam`) |
 | `backtest_monthly` | 34 | 17-month replay: `current` vs `proposed` policy |
-| `scenario_grid` | 26,440 | Per part × service level: ROP, Max, average inventory value, expected stockouts (for the scenario simulator) |
+| `scenario_grid` | 27,392 | Per part × service level: ROP, Max, average inventory value, expected stockouts (for the scenario simulator) |
 | `twin_groups` | 597 | Duplicate material numbers merged into one part |
 | `kit_rules` | 187 | Parts usually issued together (support, confidence, lift) |
 | `suppliers` | 124 | Median lead time, late rate, reliability score |
-| `data_quality_log` | 18 | Every cleaning action: source, issue, rows affected, action, reason |
+| `data_quality_log` | 20 | Every cleaning action: source, issue, rows affected, action, reason |
 | `data_quality_score` | 6 | Clean-row share per source file |
-| `kpis` | 49 | Headline numbers for the dashboard and deck |
+| `kpis` | 62 | Headline numbers for the dashboard and deck |
 
 ---
 
@@ -191,9 +206,13 @@ python pipeline/make_dummy_db.py      # -> output/spareparts_dummy.db
 | Assumption | Value | Where |
 | --- | --- | --- |
 | Criticality order | A > B > C > S (confirmed by organisers) | `01_cleaning.py` |
+| Purchasing group meaning | Department that owns the item (confirmed by organisers) | `01_cleaning.py` |
+| Non Stock conversion rule | Criticality A/B, used in ≥ 2 months, lead time > 42 days or no PO | `01_cleaning.py` |
 | Carrying cost | 20% of item value per year | `06_optimize.py` |
 | Ordering cost | Rp 1.5 M per purchase order | `06_optimize.py` |
 | Stockout cost per event | A Rp 750 M · B Rp 200 M · C Rp 50 M · S Rp 10 M | `06_optimize.py` |
+| Urgent sourcing trigger | Criticality A and (≥ 20% stockout risk or stock below safety stock) | `06_optimize.py` |
+| Replacement factor | Consumables 100%; others historical issued ÷ installed | `07_tam_readiness.py` |
 | FX rates | USD 16,300 · EUR 17,700 · SGD 12,600 · JPY 105 | `01_cleaning.py` |
 | Turnaround window | Nov-2025 to Jan-2026 | `02_forecast.py` |
 | Snapshot date | 1 Oct 2026 (data ends 30 Sep 2026) | all stages |
@@ -204,9 +223,11 @@ python pipeline/make_dummy_db.py      # -> output/spareparts_dummy.db
 - The baseline dataset is **dummy data**; results show the method, not real plant performance.
 - 2,575 of 3,305 stock items have **estimated prices** (56% within 2× in validation). Rupiah totals that include estimated prices should be read as indicative; actual-price figures are reported separately in `kpis`.
 - Only 17 months of history: yearly seasonality cannot be learned.
-- Consumption records only fulfilled issues, so stockouts in the replay are **simulated**.
-- The replay with turnaround readiness assumes the turnaround scope is known in advance; it is an upper bound. The parameters-only result (−59% stockouts) is the conservative figure.
+- Consumption records only fulfilled issues, so stockouts in the replay are **simulated**. Non Stock conversion candidates count as stockouts under the current policy because they are never stocked; compare stock items only for a like-for-like view.
+- The replay with turnaround readiness assumes the turnaround scope is known in advance; it is an upper bound. The parameters-only result (−59% stockouts on stock items) is the conservative figure.
 - Maintenance plans are not linked to spare parts directly; the link goes through functional location → BoM, and only 56% of planned functional locations have BoM data. PM due dates did not add predictive power in the global model.
+- Only 36 parts were ever bought from more than one supplier, so most urgent-sourcing suggestions are same-category alternatives that Procurement still needs to qualify.
+- Only 730 parts have purchasing-group data from POs; the rest are inferred from their category.
 - The notification → order → material link appears random in the dummy data, so the NLP classes could not be validated against parts issued.
 - Stockout costs are assumptions, not company figures.
 
