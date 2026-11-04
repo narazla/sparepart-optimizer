@@ -1,4 +1,4 @@
-# <PLATFORM NAME> — AI & Data Pipeline
+# <PLATFORM NAME> AI & Data Pipeline
 
 **Spare Part Intelligence & Inventory Optimization** · CALIBER 2026 Final Case
 
