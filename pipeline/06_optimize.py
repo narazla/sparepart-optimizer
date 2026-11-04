@@ -233,70 +233,121 @@ recs = r[["status", "action", "qty", "order_by_date", "value_impact", "stockout_
           "sourcing_mode", "supplier", "reason"]]
 print(recs.groupby(["status", "action"]).agg(n=("qty", "size"), value_bn=("value_impact", lambda v: v.sum() / 1e9)).round(1))
 
-# ---------------------------------------------------------------- 5. replay backtest
+# ---------------------------------------------------------------- 5. replay backtest (HOLDOUT, tanpa kebocoran)
+# Parameter kedua kebijakan disusun HANYA dari data s.d. Maret 2026, lalu diuji pada April-September 2026
+# (6 bulan yang tidak pernah dilihat). Window TAM (Nov-25..Jan-26) berada di periode latih.
+#   current  : Min-Max yang tercatat di BoM
+#   proposed : ROP/Max hasil optimasi biaya-risiko dengan
+#              - peluang kebutuhan dari model global yang dilatih s.d. Mar-26 (need_prob_holdout)
+#              - ukuran pemakaian dari bulan rutin s.d. Mar-26
+#              - lead time P50/P80 dari PO dengan PR sebelum Apr-26
+# Kedua kebijakan mulai dari level Max masing-masing pada 1 Apr 2026 (kondisi steady-state).
+SPLIT = pd.Period("2026-04", "M")
+clean_s = series["clean"].reindex(sm.index).fillna(0)
 raw = series["raw"].reindex(sm.index).fillna(0)
-months = list(raw.columns)
 tam_m = set(L("tam_months"))
-Lm = np.maximum(1, np.round(sm["lt_p50"] / 30.4375)).astype(int).values
+train_cols = [c for c in clean_s.columns if c < SPLIT and str(c) not in tam_m]
+test_cols = [c for c in raw.columns if c >= SPLIT]
+tr_nz = clean_s[train_cols].where(clean_s[train_cols] > 0)
+size_tr = tr_nz.mean(axis=1).fillna(0)
+sd_tr = tr_nz.std(axis=1, ddof=0).fillna(size_tr * 0.5)
+p_tr = L("need_prob_holdout").reindex(sm.index).fillna(0)
+p_tr = np.where(size_tr > 0, p_tr, 0.0)
+ppt = pp[pp.lt_valid & (pp["PR-Date"] < SPLIT.to_timestamp())]
+ppt = ppt.assign(category=ppt["PR-Material"].map(sm["category"]))
+lt50 = ppt.groupby("PR-Material")["lead_time"].median()
+lt80 = ppt.groupby("PR-Material")["lead_time"].quantile(0.8)
+c50 = ppt.groupby("category")["lead_time"].median(); c80 = ppt.groupby("category")["lead_time"].quantile(0.8)
+L50 = lt50.reindex(sm.index).fillna(sm["category"].map(c50)).fillna(ppt.lead_time.median())
+L80 = np.maximum(lt80.reindex(sm.index).fillna(sm["category"].map(c80)).fillna(ppt.lead_time.quantile(0.8)), L50)
+tam_tr = raw[[c for c in raw.columns if str(c) in tam_m]].sum(axis=1)
+hs, hS = np.zeros(len(sm)), np.zeros(len(sm))
+for i, m in enumerate(sm.index):
+    x = sm.loc[m]
+    if size_tr[m] > 0 and p_tr[i] > 0:
+        ltd = ltd_samples(p_tr[i], size_tr[m], sd_tr[m], L50[m], L80[m])[:1000]
+        D = 12 * p_tr[i] * size_tr[m]
+        Q = float(np.ceil(np.clip(np.sqrt(2 * D * ORDER_COST / (CARRY * max(x.price, 1))),
+                                  max(1, np.ceil(size_tr[m])), max(1, np.ceil(D)))))
+        best_c, best_rop = None, 0.0
+        for sl in SL_GRID:
+            rop = float(np.ceil(np.quantile(ltd, sl)))
+            cost = CARRY * (max(rop - ltd.mean(), 0) + Q / 2) * x.price + np.mean(ltd > rop) * (D / Q) * STOCKOUT_COST[x.criticality]
+            if best_c is None or cost < best_c:
+                best_c, best_rop = cost, rop
+        hs[i], hS[i] = best_rop, best_rop + Q
+    else:                                                   # tanpa demand rutin di periode latih
+        keep = 0.0
+        if x.criticality == "A":
+            keep = max(1, min(np.ceil(0.1 * x.installed_qty), 5))
+        if tam_tr[m] > 0:
+            keep = max(keep, tam_tr[m])
+        hs[i], hS[i] = 0.0, keep
+
+Lm = np.maximum(1, np.round(L50.values / 30.4375)).astype(int)
 price = sm["price"].values
 crit_a = (sm["criticality"] == "A").values
-dem = raw.values
-def replay(s_lvl, S_lvl, label, tam_plan=None):
-    n = len(sm); on_hand = S_lvl.copy().astype(float); pipe = {}
-    out = []
-    for t, mo in enumerate(months):
-        arr = pipe.pop(t, np.zeros(n)); on_hand += arr
-        d = dem[:, t].copy()
-        if tam_plan is not None and str(mo) in tam_m:
-            on_hand += tam_plan[:, t]                                       # kit TAM yang dipesan 3+ bulan sebelumnya
+is_si = (sm["mrp"] == "Stock Item").values
+dem = raw[test_cols].values
+def replay(s_lvl, S_lvl, label):
+    n = len(sm); on_hand = S_lvl.copy().astype(float); pipe = {}; out = []
+    for t, mo in enumerate(test_cols):
+        on_hand += pipe.pop(t, np.zeros(n))
+        d = dem[:, t]
+        served = np.minimum(d, on_hand)
         short = d > on_hand + 1e-9
-        on_hand = np.maximum(on_hand - d, 0)
-        onorder = sum(v for k, v in pipe.items())
-        pos = on_hand + (onorder if isinstance(onorder, np.ndarray) else 0)
+        on_hand = on_hand - served
+        onorder = sum(pipe.values()) if pipe else np.zeros(n)
+        pos = on_hand + onorder
         need = (pos <= s_lvl) & (S_lvl > 0)
         q = np.where(need, S_lvl - pos, 0)
         for i in np.flatnonzero(q > 0):
             pipe.setdefault(t + Lm[i], np.zeros(n))[i] += q[i]
+        has_d = d > 0
         out.append(dict(month=str(mo), policy=label, inventory_value=float((on_hand * price).sum()),
                         stockouts=int(short.sum()), stockouts_critical=int((short & crit_a).sum()),
-                        stockouts_si=int((short & is_si).sum()), stockouts_si_a=int((short & is_si & crit_a).sum())))
+                        stockouts_si=int((short & is_si).sum()), stockouts_si_a=int((short & is_si & crit_a).sum()),
+                        demand_lines=int(has_d.sum()), served_lines=int((has_d & ~short).sum()),
+                        demand_lines_si=int((has_d & is_si).sum()), served_lines_si=int((has_d & ~short & is_si).sum()),
+                        demand_units=float(d.sum()), served_units=float(served.sum())))
     return pd.DataFrame(out)
-is_si = (sm["mrp"] == "Stock Item").values
 
-old = replay(sm["min_old"].values, sm["max_old"].values, "current")
-new_s, new_S = params["rop"].fillna(0).values, params["max_new"].fillna(0).values
-new = replay(new_s, new_S, "proposed_policy")
-tam_plan = np.zeros_like(dem)
-for t, mo in enumerate(months):
-    if str(mo) in tam_m:
-        tam_plan[:, t] = np.where(sm["tam_qty"].values > 0, dem[:, t], 0)   # kebutuhan TAM direncanakan dari Readiness
-newt = replay(new_s, new_S, "proposed", tam_plan=tam_plan)
-bt = pd.concat([old, newt])
-summ = pd.concat([old, new, newt]).groupby("policy").agg(avg_inv_bn=("inventory_value", lambda v: v.mean() / 1e9),
-                                                         stockouts=("stockouts", "sum"),
-                                                         critical=("stockouts_critical", "sum"),
-                                                         stock_items=("stockouts_si", "sum"),
-                                                         stock_items_a=("stockouts_si_a", "sum"))
-print("\nReplay 17 bulan:\n", summ.round(1).to_string())
-demand_events = int((dem > 0).sum())
+old = replay(sm["min_old"].values.astype(float), sm["max_old"].values.astype(float), "current")
+new = replay(hs, hS, "proposed")
+bt = pd.concat([old, new])
+summ = bt.groupby("policy").agg(avg_inv_bn=("inventory_value", lambda v: v.mean() / 1e9),
+                                stockouts=("stockouts", "sum"), critical=("stockouts_critical", "sum"),
+                                stock_items=("stockouts_si", "sum"), stock_items_a=("stockouts_si_a", "sum"),
+                                dl=("demand_lines", "sum"), sl=("served_lines", "sum"),
+                                dls=("demand_lines_si", "sum"), sls=("served_lines_si", "sum"),
+                                du=("demand_units", "sum"), su=("served_units", "sum"))
+summ["fill_rate"] = summ.sl / summ.dl
+summ["fill_rate_si"] = summ.sls / summ.dls
+summ["unit_fill_rate"] = summ.su / summ.du
+print(f"\nReplay HOLDOUT ({test_cols[0]}..{test_cols[-1]}, parameters built from data up to Mar-26):")
+print(summ[["avg_inv_bn", "stockouts", "critical", "stock_items", "stock_items_a", "fill_rate", "fill_rate_si",
+            "unit_fill_rate"]].round(3).to_string())
+bt = bt[["month", "policy", "inventory_value", "stockouts", "stockouts_critical"]]
 
 # ---------------------------------------------------------------- KPI tambahan
 o, n_ = summ.loc["current"], summ.loc["proposed"]
-cur_risk = sum(STOCKOUT_COST[c] for c in sm.criticality) * 0  # placeholder agar jelas: lihat simulator
 extra = [
-    ("bt_stockouts_old", o.stockouts, "Replay: stockout events, current Min-Max"),
-    ("bt_stockouts_new", n_.stockouts, "Replay: stockout events, proposed policy"),
+    ("bt_test_period", 6, "Replay: holdout months Apr-Sep 2026 (parameters from data up to Mar-2026)"),
+    ("bt_stockouts_old", o.stockouts, "Replay: stockout part-months, current Min-Max"),
+    ("bt_stockouts_new", n_.stockouts, "Replay: stockout part-months, proposed policy"),
     ("bt_critical_old", o.critical, "Replay: criticality-A stockouts, current"),
     ("bt_critical_new", n_.critical, "Replay: criticality-A stockouts, proposed policy"),
-    ("bt_inv_old", o.avg_inv_bn * 1e9, "Replay: average inventory value, current"),
-    ("bt_inv_new", n_.avg_inv_bn * 1e9, "Replay: average inventory value, proposed policy"),
-    ("bt_demand_events", demand_events, "Replay: part-months with demand"),
-    ("bt_si_old", o.stock_items, "Replay: stockouts, current stock items only"),
-    ("bt_si_new", n_.stock_items, "Replay: stockouts, stock items only, proposed policy"),
-    ("bt_si_policy_only", summ.loc["proposed_policy", "stock_items"], "Replay: stockouts, stock items only, parameters without TAM readiness"),
-    ("bt_policy_only", summ.loc["proposed_policy", "stockouts"], "Replay: stockouts, parameters without TAM readiness"),
+    ("bt_si_old", o.stock_items, "Replay: stockouts, stock items only, current"),
+    ("bt_si_new", n_.stock_items, "Replay: stockouts, stock items only, proposed"),
     ("bt_si_a_old", o.stock_items_a, "Replay: criticality-A stockouts, stock items only, current"),
     ("bt_si_a_new", n_.stock_items_a, "Replay: criticality-A stockouts, stock items only, proposed"),
+    ("bt_fill_old", o.fill_rate, "Replay: share of part-months with demand fully served, current"),
+    ("bt_fill_new", n_.fill_rate, "Replay: share of part-months with demand fully served, proposed"),
+    ("bt_fill_si_old", o.fill_rate_si, "Replay: fill rate, stock items only, current"),
+    ("bt_fill_si_new", n_.fill_rate_si, "Replay: fill rate, stock items only, proposed"),
+    ("bt_inv_old", o.avg_inv_bn * 1e9, "Replay: average inventory value, current"),
+    ("bt_inv_new", n_.avg_inv_bn * 1e9, "Replay: average inventory value, proposed policy"),
+    ("bt_demand_lines", o.dl, "Replay: part-months with demand in holdout"),
     ("convert_to_stock", int((r.action == "Convert to Stock").sum()), "Non Stock parts recommended to convert to Stock Item"),
     ("urgent_sourcing", int((r.sourcing_mode == "Urgent").sum()), "Buy recommendations using urgent sourcing"),
     ("on_order_lines", int((sm.on_order > 0).sum()), "Parts with open purchase orders"),

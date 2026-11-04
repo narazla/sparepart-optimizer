@@ -135,26 +135,33 @@ src["lt_normal"] = normal["lt"].reindex(src.index)
 src["supplier_urgent"] = urgent["name"].reindex(src.index)
 src["lt_urgent"] = urgent["lt"].reindex(src.index)
 src["late_urgent"] = urgent["late"].reindex(src.index)
-src["urgent_source"] = np.where(n_sup.reindex(src.index).fillna(0) > 1, "same part, faster supplier", "same part")
+# catatan: per nomor material ASLI tidak ada part dengan >1 supplier. Supplier ganda hanya muncul setelah nomor kembar
+# digabung (nomor yang berbeda dibeli dari supplier berbeda).
+n_sup_orig = d.groupby("orig_material")["PO-Supplier Code"].nunique()
+src["urgent_source"] = np.where(n_sup.reindex(src.index).fillna(0) > 1,
+                                "supplier used for a duplicate material number of the same part", "same part")
 single = n_sup.reindex(src.index).fillna(0) <= 1
 cb = sm["category"].map(cat_best["name"]); cl = sm["category"].map(cat_best["lt"]); cr = sm["category"].map(cat_best["late"])
 no_hist = src["supplier_urgent"].isna() & cb.notna()
 faster = single & cb.notna() & src["supplier_urgent"].notna() & \
          (cl * (1 + cr) < 0.8 * src["lt_urgent"] * (1 + src["late_urgent"].fillna(0)))
-for mask, label in ((faster, "alternative supplier, same category (>=20% faster)"),
-                    (no_hist, "suggested supplier, same category (no purchase history)")):
+for mask, label in ((faster, "candidate supplier from same category, >=20% faster, to be qualified"),
+                    (no_hist, "candidate supplier from same category (no purchase history), to be qualified")):
     src.loc[mask, "supplier_urgent"] = cb[mask]; src.loc[mask, "lt_urgent"] = cl[mask]
     src.loc[mask, "late_urgent"] = cr[mask]; src.loc[mask, "urgent_source"] = label
 src.loc[no_hist, "supplier_normal"] = cb[no_hist]
 src.loc[no_hist, "lt_normal"] = cl[no_hist]
 src["urgent_source"] = np.where(src["supplier_urgent"].isna(), None, src["urgent_source"])
-multi = int((n_sup > 1).sum()); diff = int(((n_sup > 1) & (normal["name"] != urgent["name"].reindex(normal.index))).sum())
-print(f"\nSourcing: {multi} parts with >1 supplier ({diff} where cheapest != fastest); "
+multi = int((n_sup_orig > 1).sum()); twin_multi = int((n_sup > 1).sum())
+diff = int(((n_sup > 1) & (normal["name"] != urgent["name"].reindex(normal.index))).sum())
+print(f"\nSourcing: {multi} material numbers with >1 supplier; {twin_multi} merged parts bought from different suppliers "
+      f"under duplicate numbers ({diff} where cheapest != fastest); "
       f"{int(faster.sum())} single-supplier parts get a >=20% faster alternative; "
       f"{int(no_hist.sum())} parts without purchase history get a suggested supplier")
 S(src, "sourcing")
-S(pd.DataFrame([("multi_supplier_parts", multi, "Parts bought from more than one supplier"),
-                ("cheap_vs_fast_differs", diff, "Parts where cheapest supplier is not the fastest"),
+S(pd.DataFrame([("multi_supplier_parts", multi, "Material numbers bought from more than one supplier"),
+                ("twin_supplier_parts", twin_multi, "Merged duplicate parts bought from different suppliers under different numbers"),
+                ("cheap_vs_fast_differs", diff, "Merged duplicate parts where cheapest supplier is not the fastest"),
                 ("category_alternatives", int(faster.sum()), "Single-supplier parts with a >=20% faster alternative in the same category"),
                 ("suggested_supplier_new", int(no_hist.sum()), "Parts without purchase history given a suggested supplier")],
                columns=["key", "value", "label"]), "kpis_sourcing")

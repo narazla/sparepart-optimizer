@@ -129,6 +129,8 @@ for m in FUT:
                              "pm_due": (pm_mat[m] > 0).astype(int).values}))
 fut = pd.concat(fut)
 fut.to_pickle(os.path.join(INT, "need_prob.pkl"))
+# prediksi holdout (model hanya melihat data s.d. Mar-26) -> dipakai replay tanpa kebocoran
+pd.Series(p, index=te.index).groupby(level=0).mean().to_pickle(os.path.join(INT, "need_prob_holdout.pkl"))
 ev.to_pickle(os.path.join(INT, "gbm_eval.pkl")); imp.to_pickle(os.path.join(INT, "gbm_importance.pkl"))
 print("\nFuture need prob: mean", round(fut.need_prob_gbm.mean(), 4), "| parts with PM due in horizon",
       fut[fut.pm_due == 1].material_no.nunique())

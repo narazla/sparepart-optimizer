@@ -157,7 +157,7 @@ kp = [("inventory_value", sm.stock_value.sum(), "Total inventory value (incl. es
       ("insurance_count", int((recs.status == "Insurance Spare").sum()), "Insurance spares kept"),
       ("twin_groups", int(tw.twin_group.nunique()), "Duplicate material groups merged"),
       ("lt_median", float(pp[pp.lt_valid].lead_time.median()), "Median lead time (days)"),
-      ("late_rate", float(pp[pp.late_valid].is_late.mean()), "POs delivered after required date"),
+      ("late_rate", float(pp[pp.lt_valid].is_late.mean()), "POs delivered after required date"),
       ("tam_share", float(load("forecast_headline")["tam_share"]), "Share of consumption during TAM window")]
 if has("forecast_headline"):
     h = load("forecast_headline")
